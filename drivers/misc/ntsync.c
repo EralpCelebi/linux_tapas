@@ -721,21 +721,12 @@ static struct ntsync_obj *ntsync_alloc_obj(struct ntsync_device *dev,
 
 static int ntsync_obj_get_fd(struct ntsync_obj *obj)
 {
-	struct file *file;
-	int fd;
-
-	fd = get_unused_fd_flags(O_CLOEXEC);
-	if (fd < 0)
-		return fd;
-	file = anon_inode_getfile("ntsync", &ntsync_obj_fops, obj, O_RDWR);
-	if (IS_ERR(file)) {
-		put_unused_fd(fd);
-		return PTR_ERR(file);
-	}
-	obj->file = file;
-	fd_install(fd, file);
-
-	return fd;
+	FD_PREPARE(fdf, O_CLOEXEC,
+		   anon_inode_getfile("ntsync", &ntsync_obj_fops, obj, O_RDWR));
+	if (fdf.err)
+		return fdf.err;
+	obj->file = fd_prepare_file(fdf);
+	return fd_publish(fdf);
 }
 
 static int ntsync_create_sem(struct ntsync_device *dev, void __user *argp)
@@ -873,6 +864,7 @@ static int setup_wait(struct ntsync_device *dev,
 {
 	int fds[NTSYNC_MAX_WAIT_COUNT + 1];
 	const __u32 count = args->count;
+	size_t size = array_size(count, sizeof(fds[0]));
 	struct ntsync_q *q;
 	__u32 total_count;
 	__u32 i, j;
@@ -880,15 +872,14 @@ static int setup_wait(struct ntsync_device *dev,
 	if (args->pad || (args->flags & ~NTSYNC_WAIT_REALTIME))
 		return -EINVAL;
 
-	if (args->count > NTSYNC_MAX_WAIT_COUNT)
+	if (size >= sizeof(fds))
 		return -EINVAL;
 
 	total_count = count;
 	if (args->alert)
 		total_count++;
 
-	if (copy_from_user(fds, u64_to_user_ptr(args->objs),
-			   array_size(count, sizeof(*fds))))
+	if (copy_from_user(fds, u64_to_user_ptr(args->objs), size))
 		return -EFAULT;
 	if (args->alert)
 		fds[count] = args->alert;
@@ -1208,6 +1199,7 @@ static struct miscdevice ntsync_misc = {
 	.minor		= MISC_DYNAMIC_MINOR,
 	.name		= NTSYNC_NAME,
 	.fops		= &ntsync_fops,
+	.mode		= 0666,
 };
 
 module_misc_device(ntsync_misc);

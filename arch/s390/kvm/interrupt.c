@@ -7,12 +7,13 @@
  *    Author(s): Carsten Otte <cotte@de.ibm.com>
  */
 
-#define KMSG_COMPONENT "kvm-s390"
-#define pr_fmt(fmt) KMSG_COMPONENT ": " fmt
+#define pr_fmt(fmt) "kvm-s390: " fmt
 
+#include <linux/cpufeature.h>
 #include <linux/interrupt.h>
 #include <linux/kvm_host.h>
 #include <linux/hrtimer.h>
+#include <linux/export.h>
 #include <linux/mmu_context.h>
 #include <linux/nospec.h>
 #include <linux/signal.h>
@@ -577,7 +578,7 @@ static int __write_machine_check(struct kvm_vcpu *vcpu,
 	/* take care of lazy register loading */
 	kvm_s390_fpu_store(vcpu->run);
 	save_access_regs(vcpu->run->s.regs.acrs);
-	if (MACHINE_HAS_GS && vcpu->arch.gs_enabled)
+	if (cpu_has_gs() && vcpu->arch.gs_enabled)
 		save_gs_cb(current->thread.gs_cb);
 
 	/* Extended save area */
@@ -948,8 +949,7 @@ static int __must_check __deliver_prog(struct kvm_vcpu *vcpu)
 	rc |= put_guest_lc(vcpu, ilen, (u16 *) __LC_PGM_ILC);
 	rc |= put_guest_lc(vcpu, vcpu->arch.sie_block->gbea,
 				 (u64 *) __LC_PGM_LAST_BREAK);
-	rc |= put_guest_lc(vcpu, pgm_info.code,
-			   (u16 *)__LC_PGM_INT_CODE);
+	rc |= put_guest_lc(vcpu, pgm_info.code, (u16 *)__LC_PGM_CODE);
 	rc |= write_guest_lc(vcpu, __LC_PGM_OLD_PSW,
 			     &vcpu->arch.sie_block->gpsw, sizeof(psw_t));
 	rc |= read_guest_lc(vcpu, __LC_PGM_NEW_PSW,
@@ -1322,6 +1322,7 @@ int kvm_s390_handle_wait(struct kvm_vcpu *vcpu)
 	VCPU_EVENT(vcpu, 4, "enabled wait: %llu ns", sltime);
 no_timer:
 	kvm_vcpu_srcu_read_unlock(vcpu);
+	vcpu->kvm->arch.float_int.last_sleep_cpu = vcpu->vcpu_idx;
 	kvm_vcpu_halt(vcpu);
 	vcpu->valid_wakeup = false;
 	__unset_cpu_idle(vcpu);
@@ -1948,18 +1949,15 @@ static void __floating_irq_kick(struct kvm *kvm, u64 type)
 	if (!online_vcpus)
 		return;
 
-	/* find idle VCPUs first, then round robin */
-	sigcpu = find_first_bit(kvm->arch.idle_mask, online_vcpus);
-	if (sigcpu == online_vcpus) {
-		do {
-			sigcpu = kvm->arch.float_int.next_rr_cpu++;
-			kvm->arch.float_int.next_rr_cpu %= online_vcpus;
-			/* avoid endless loops if all vcpus are stopped */
-			if (nr_tries++ >= online_vcpus)
-				return;
-		} while (is_vcpu_stopped(kvm_get_vcpu(kvm, sigcpu)));
+	for (sigcpu = kvm->arch.float_int.last_sleep_cpu; ; sigcpu++) {
+		sigcpu %= online_vcpus;
+		dst_vcpu = kvm_get_vcpu(kvm, sigcpu);
+		if (!is_vcpu_stopped(dst_vcpu))
+			break;
+		/* avoid endless loops if all vcpus are stopped */
+		if (nr_tries++ >= online_vcpus)
+			return;
 	}
-	dst_vcpu = kvm_get_vcpu(kvm, sigcpu);
 
 	/* make the VCPU drop out of the SIE, or wake it up if sleeping */
 	switch (type) {
@@ -2777,12 +2775,19 @@ static unsigned long get_ind_bit(__u64 addr, unsigned long bit_nr, bool swap)
 
 static struct page *get_map_page(struct kvm *kvm, u64 uaddr)
 {
+	struct mm_struct *mm = kvm->mm;
 	struct page *page = NULL;
+	int locked = 1;
 
-	mmap_read_lock(kvm->mm);
-	get_user_pages_remote(kvm->mm, uaddr, 1, FOLL_WRITE,
-			      &page, NULL);
-	mmap_read_unlock(kvm->mm);
+	if (mmget_not_zero(mm)) {
+		mmap_read_lock(mm);
+		get_user_pages_remote(mm, uaddr, 1, FOLL_WRITE,
+				      &page, &locked);
+		if (locked)
+			mmap_read_unlock(mm);
+		mmput(mm);
+	}
+
 	return page;
 }
 
@@ -3161,7 +3166,7 @@ void kvm_s390_gisa_clear(struct kvm *kvm)
 	if (!gi->origin)
 		return;
 	gisa_clear_ipm(gi->origin);
-	VM_EVENT(kvm, 3, "gisa 0x%pK cleared", gi->origin);
+	VM_EVENT(kvm, 3, "gisa 0x%p cleared", gi->origin);
 }
 
 void kvm_s390_gisa_init(struct kvm *kvm)
@@ -3174,11 +3179,10 @@ void kvm_s390_gisa_init(struct kvm *kvm)
 	gi->alert.mask = 0;
 	spin_lock_init(&gi->alert.ref_lock);
 	gi->expires = 50 * 1000; /* 50 usec */
-	hrtimer_init(&gi->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
-	gi->timer.function = gisa_vcpu_kicker;
+	hrtimer_setup(&gi->timer, gisa_vcpu_kicker, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 	memset(gi->origin, 0, sizeof(struct kvm_s390_gisa));
 	gi->origin->next_alert = (u32)virt_to_phys(gi->origin);
-	VM_EVENT(kvm, 3, "gisa 0x%pK initialized", gi->origin);
+	VM_EVENT(kvm, 3, "gisa 0x%p initialized", gi->origin);
 }
 
 void kvm_s390_gisa_enable(struct kvm *kvm)
@@ -3219,7 +3223,7 @@ void kvm_s390_gisa_destroy(struct kvm *kvm)
 		process_gib_alert_list();
 	hrtimer_cancel(&gi->timer);
 	gi->origin = NULL;
-	VM_EVENT(kvm, 3, "gisa 0x%pK destroyed", gisa);
+	VM_EVENT(kvm, 3, "gisa 0x%p destroyed", gisa);
 }
 
 void kvm_s390_gisa_disable(struct kvm *kvm)
@@ -3468,7 +3472,7 @@ int __init kvm_s390_gib_init(u8 nisc)
 		}
 	}
 
-	KVM_EVENT(3, "gib 0x%pK (nisc=%d) initialized", gib, gib->nisc);
+	KVM_EVENT(3, "gib 0x%p (nisc=%d) initialized", gib, gib->nisc);
 	goto out;
 
 out_unreg_gal:

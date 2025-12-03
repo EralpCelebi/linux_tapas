@@ -10,8 +10,7 @@
  * Author(s): Hendrik Brueckner <brueckner@linux.vnet.ibm.com>
  *
  */
-#define KMSG_COMPONENT		"smsgiucv_app"
-#define pr_fmt(fmt)		KMSG_COMPONENT ": " fmt
+#define pr_fmt(fmt) "smsgiucv_app: " fmt
 
 #include <linux/ctype.h>
 #include <linux/err.h>
@@ -23,6 +22,7 @@
 #include <linux/spinlock.h>
 #include <linux/workqueue.h>
 #include <net/iucv/iucv.h>
+#include <asm/machine.h>
 #include "smsgiucv.h"
 
 /* prefix used for SMSG registration */
@@ -153,14 +153,14 @@ static int __init smsgiucv_app_init(void)
 	struct device_driver *smsgiucv_drv;
 	int rc;
 
-	if (!MACHINE_IS_VM)
+	if (!machine_is_vm())
 		return -ENODEV;
 
 	smsgiucv_drv = driver_find(SMSGIUCV_DRV_NAME, &iucv_bus);
 	if (!smsgiucv_drv)
 		return -ENODEV;
 
-	smsg_app_dev = iucv_alloc_device(NULL, smsgiucv_drv, NULL, KMSG_COMPONENT);
+	smsg_app_dev = iucv_alloc_device(NULL, smsgiucv_drv, NULL, "smsgiucv_app");
 	if (!smsg_app_dev)
 		return -ENOMEM;
 

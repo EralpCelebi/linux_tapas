@@ -7,18 +7,17 @@
  *
  */
 
-#define KMSG_COMPONENT "zpci"
-#define pr_fmt(fmt) KMSG_COMPONENT ": " fmt
+#define pr_fmt(fmt) "zpci: " fmt
 
 #include <linux/kernel.h>
 #include <linux/slab.h>
 #include <linux/err.h>
-#include <linux/export.h>
 #include <linux/delay.h>
 #include <linux/seq_file.h>
 #include <linux/jump_label.h>
 #include <linux/pci.h>
 #include <linux/printk.h>
+#include <linux/dma-direct.h>
 
 #include <asm/pci_clp.h>
 #include <asm/pci_dma.h>
@@ -45,8 +44,10 @@ static int zpci_bus_prepare_device(struct zpci_dev *zdev)
 
 	if (!zdev_enabled(zdev)) {
 		rc = zpci_enable_device(zdev);
-		if (rc)
+		if (rc) {
+			pr_err("Enabling PCI function %08x failed\n", zdev->fid);
 			return rc;
+		}
 	}
 
 	if (!zdev->has_resources) {
@@ -283,9 +284,31 @@ static struct zpci_bus *zpci_bus_alloc(int topo, bool topo_is_tid)
 	return zbus;
 }
 
+static void pci_dma_range_setup(struct pci_dev *pdev)
+{
+	struct zpci_dev *zdev = to_zpci(pdev);
+	u64 aligned_end, size;
+	dma_addr_t dma_start;
+	int ret;
+
+	dma_start = PAGE_ALIGN(zdev->start_dma);
+	aligned_end = PAGE_ALIGN_DOWN(zdev->end_dma + 1);
+	if (aligned_end >= dma_start)
+		size = aligned_end - dma_start;
+	else
+		size = 0;
+	WARN_ON_ONCE(size == 0);
+
+	ret = dma_direct_set_offset(&pdev->dev, 0, dma_start, size);
+	if (ret)
+		pr_err("Failed to allocate DMA range map for %s\n", pci_name(pdev));
+}
+
 void pcibios_bus_add_device(struct pci_dev *pdev)
 {
 	struct zpci_dev *zdev = to_zpci(pdev);
+
+	pci_dma_range_setup(pdev);
 
 	/*
 	 * With pdev->no_vf_scan the common PCI probing code does not
@@ -334,6 +357,9 @@ error:
 static bool zpci_bus_is_isolated_vf(struct zpci_bus *zbus, struct zpci_dev *zdev)
 {
 	struct pci_dev *pdev;
+
+	if (!zdev->vfn)
+		return false;
 
 	pdev = zpci_iov_find_parent_pf(zbus, zdev);
 	if (!pdev)

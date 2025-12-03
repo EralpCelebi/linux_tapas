@@ -26,7 +26,7 @@ struct restart_block {
 	unsigned long arch_data;
 	long (*fn)(struct restart_block *);
 	union {
-		/* For futex_wait and futex_wait_requeue_pi */
+		/* For futex_wait() */
 		struct {
 			u32 __user *uaddr;
 			u32 val;
@@ -43,7 +43,7 @@ struct restart_block {
 				struct __kernel_timespec __user *rmtp;
 				struct old_timespec32 __user *compat_rmtp;
 			};
-			u64 expires;
+			ktime_t expires;
 		} nanosleep;
 		/* For poll */
 		struct {
